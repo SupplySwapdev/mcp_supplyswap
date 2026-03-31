@@ -116,6 +116,27 @@ async def get_order_details(order_id: int) -> Dict:
 
 
 @mcp.tool()
+async def get_orders_details_batch(order_ids: List[int]) -> List[Dict]:
+    """Get full details for multiple orders in one shot — all fetched in parallel.
+
+    Use this instead of calling get_order_details repeatedly. Ideal after a search
+    returns a list of order IDs and you need the full data for all of them.
+
+    Args:
+        order_ids: List of numeric BaseLinker order IDs (max 20 at a time).
+    """
+    async def _fetch_one(oid: int) -> Dict:
+        try:
+            result = await asyncio.to_thread(bl.call, "getOrders", {"order_id": oid})
+            orders = result.get("orders", [])
+            return orders[0] if orders else {"order_id": oid, "error": "not found"}
+        except Exception as e:
+            return {"order_id": oid, "error": str(e)}
+
+    return await asyncio.gather(*[_fetch_one(oid) for oid in order_ids[:20]])
+
+
+@mcp.tool()
 async def search_orders_by_email(email: str) -> List[Dict]:
     """Find all orders from a specific customer email address.
 
