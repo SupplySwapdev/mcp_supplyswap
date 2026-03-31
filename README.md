@@ -13,8 +13,9 @@ Monorepo for all SupplySwap MCP (Model Context Protocol) servers — hosted on G
 
 ### Google Chat MCP
 - **URL:** `https://google-chat-mcp-253940259390.us-central1.run.app/sse`
-- **Auth:** Bearer token — each user gets their own token via `/setup`
-- **Onboarding:** visit `/setup` and sign in with your `@supplyswap.com` Google account
+- **Auth:** Bearer token — each user gets their own personal token
+- **Onboarding:** visit the setup page, sign in with your `@supplyswap.com` Google account, and copy your token
+  👉 **[https://google-chat-mcp-253940259390.us-central1.run.app/setup](https://google-chat-mcp-253940259390.us-central1.run.app/setup)**
 
 ### BaseLinker MCP
 - **URL:** `https://baselinker-mcp-253940259390.us-central1.run.app/sse`
