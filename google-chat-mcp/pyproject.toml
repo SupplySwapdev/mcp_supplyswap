@@ -1,0 +1,23 @@
+[project]
+name = "mcp-gcp-chat-py"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Zz Chen", email = "chy168@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "fastmcp>=0.4.1,<0.5.0",
+    "httpx>=0.24.0",
+    "google-auth>=2.22.0",
+    "google-auth-oauthlib>=1.0.0",
+    "google-api-python-client>=2.0.0",
+    "google-cloud-firestore>=2.13.0",
+    "fastapi>=0.68.0",
+    "uvicorn>=0.15.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

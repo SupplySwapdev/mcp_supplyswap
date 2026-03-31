@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Secrets — never commit these
+credentials.json
+token.json
+*.key
+
+# OS
+.DS_Store
