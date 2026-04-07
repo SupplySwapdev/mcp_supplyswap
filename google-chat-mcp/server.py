@@ -283,16 +283,26 @@ if __name__ == "__main__":
             with open(creds_path) as f:
                 return _json.load(f)
 
-        def _extract_bearer(request) -> str:
+        def _extract_bearer(request) -> tuple[str, str]:
             auth = request.headers.get("Authorization", "")
             if auth.lower().startswith("bearer "):
-                return auth[7:].strip()
+                return auth[7:].strip(), "header"
             # Accept common API key header variants used by MCP clients/gateways.
-            return (
+            key = (
                 request.headers.get("X-API-Key", "").strip()
                 or request.headers.get("X-BLToken", "").strip()
                 or request.headers.get("Api-Key", "").strip()
             )
+            if key:
+                return key, "header"
+            # Query fallback for clients that fail to forward headers on SSE connect.
+            q_key = (
+                request.query_params.get("api_key", "").strip()
+                or request.query_params.get("token", "").strip()
+            )
+            if q_key:
+                return q_key, "query"
+            return "", "none"
 
         def _token_fingerprint(token: str) -> str:
             if not token:
@@ -371,8 +381,7 @@ if __name__ == "__main__":
                 if path.startswith("/setup") or path == "/auth/callback":
                     return await call_next(request)
 
-                key = _extract_bearer(request)
-                source = "header"
+                key, source = _extract_bearer(request)
                 if not key and path == "/messages":
                     key = _resolve_session_key(request)
                     source = "session-fallback" if key else "none"
@@ -397,7 +406,7 @@ if __name__ == "__main__":
         sse = SseServerTransport("/messages")
 
         async def handle_sse(request):
-            key = _extract_bearer(request)
+            key, source = _extract_bearer(request)
             creds = None
             session_id = ""
 
@@ -406,7 +415,7 @@ if __name__ == "__main__":
                 creds = await asyncio.to_thread(_resolve_credentials, key)
                 if creds:
                     session_id = _create_message_session(key, request)
-                    _log_auth("/sse", "header", key, "accepted")
+                    _log_auth("/sse", source, key, "accepted")
 
             # Set per-connection context so google_chat.py uses the right account
             creds_token = _per_user_creds.set(creds)
@@ -427,8 +436,7 @@ if __name__ == "__main__":
                     _message_sessions.pop(session_id, None)
 
         async def handle_messages(request):
-            key = _extract_bearer(request)
-            source = "header"
+            key, source = _extract_bearer(request)
             if not key:
                 key = _resolve_session_key(request)
                 source = "session-fallback" if key else "none"
