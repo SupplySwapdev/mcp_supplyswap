@@ -376,7 +376,7 @@ if __name__ == "__main__":
     import uvicorn
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
-    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
     from starlette.responses import Response
     from starlette.routing import Route
     from mcp.server.sse import SseServerTransport
@@ -403,16 +403,25 @@ if __name__ == "__main__":
             # Do not silently fall back to env in HTTP/SSE mode; require per-request auth.
             return ""
 
-        class AuthMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request, call_next):
+        class AuthMiddleware:
+            def __init__(self, app):
+                self.app = app
+
+            async def __call__(self, scope, receive, send):
+                if scope.get("type") != "http":
+                    await self.app(scope, receive, send)
+                    return
+                request = Request(scope, receive=receive, send=send)
                 token = _extract_token(request)
                 if not token:
-                    return Response(
+                    response = Response(
                         "Unauthorized — provide your BaseLinker API token as the Bearer token "
                         "or X-API-Key when connecting.",
                         status_code=401,
                     )
-                return await call_next(request)
+                    await response(scope, receive, send)
+                    return
+                await self.app(scope, receive, send)
 
         sse = SseServerTransport("/messages")
 
