@@ -389,8 +389,14 @@ if __name__ == "__main__":
         from baselinker import _request_token
         import hashlib
 
-        def _extract_token(request) -> str:
+        def _extract_token(request, prefer_query: bool = False) -> str:
             """Pull the BaseLinker token from whichever auth header the client sends."""
+            q_token = (
+                request.query_params.get("api_key", "").strip()
+                or request.query_params.get("token", "").strip()
+            )
+            if prefer_query and q_token:
+                return q_token
             auth = request.headers.get("Authorization", "")
             if auth.lower().startswith("bearer "):
                 return auth[7:].strip()
@@ -401,6 +407,8 @@ if __name__ == "__main__":
             x_bl = request.headers.get("X-BLToken", "")
             if x_bl:
                 return x_bl
+            if q_token:
+                return q_token
             # Do not silently fall back to env in HTTP/SSE mode; require per-request auth.
             return ""
 
@@ -419,7 +427,9 @@ if __name__ == "__main__":
                     await self.app(scope, receive, send)
                     return
                 request = Request(scope, receive=receive, send=send)
-                token = _extract_token(request)
+                token = _extract_token(
+                    request, prefer_query=(scope.get("path") == "/sse")
+                )
                 if not token:
                     print(f"[auth] route={scope.get('path')} token=<none> decision=rejected")
                     response = Response(
@@ -437,7 +447,7 @@ if __name__ == "__main__":
         class SseEndpoint:
             async def __call__(self, scope, receive, send):
                 request = Request(scope, receive=receive)
-                token = _extract_token(request)
+                token = _extract_token(request, prefer_query=True)
                 print(f"[ctx] route=/sse set_token={_fp(token)}")
                 token_ctx = _request_token.set(token)
                 try:
