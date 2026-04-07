@@ -280,7 +280,12 @@ if __name__ == "__main__":
             auth = request.headers.get("Authorization", "")
             if auth.lower().startswith("bearer "):
                 return auth[7:].strip()
-            return request.headers.get("X-API-Key", "").strip()
+            # Accept common API key header variants used by MCP clients/gateways.
+            return (
+                request.headers.get("X-API-Key", "").strip()
+                or request.headers.get("X-BLToken", "").strip()
+                or request.headers.get("Api-Key", "").strip()
+            )
 
         def _resolve_credentials(api_key: str) -> "Credentials | None":
             """Return cached or freshly loaded Credentials for an API key."""
@@ -347,7 +352,21 @@ if __name__ == "__main__":
                 _per_user_api_key.reset(key_token)
 
         async def handle_messages(request):
-            await sse.handle_post_message(request.scope, request.receive, request._send)
+            key = _extract_bearer(request)
+            creds = None
+
+            if key and key != _legacy_api_key:
+                creds = await asyncio.to_thread(_resolve_credentials, key)
+
+            creds_token = _per_user_creds.set(creds)
+            key_token = _per_user_api_key.set(key if creds else None)
+            try:
+                await sse.handle_post_message(
+                    request.scope, request.receive, request._send
+                )
+            finally:
+                _per_user_creds.reset(creds_token)
+                _per_user_api_key.reset(key_token)
 
         # ── Setup / onboarding pages ──────────────────────────────────────────
         _SETUP_HTML = """<!DOCTYPE html>
