@@ -431,7 +431,14 @@ if __name__ == "__main__":
                 _request_token.reset(token_ctx)
 
         async def handle_messages(request):
-            await sse.handle_post_message(request.scope, request.receive, request._send)
+            token = _extract_token(request)
+            token_ctx = _request_token.set(token)
+            try:
+                await sse.handle_post_message(
+                    request.scope, request.receive, request._send
+                )
+            finally:
+                _request_token.reset(token_ctx)
 
         app = Starlette(
             routes=[
