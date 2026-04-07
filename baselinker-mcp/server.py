@@ -400,7 +400,8 @@ if __name__ == "__main__":
             x_bl = request.headers.get("X-BLToken", "")
             if x_bl:
                 return x_bl
-            return os.environ.get("BASELINKER_TOKEN", "")
+            # Do not silently fall back to env in HTTP/SSE mode; require per-request auth.
+            return ""
 
         class AuthMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request, call_next):
