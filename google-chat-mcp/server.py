@@ -239,6 +239,8 @@ if __name__ == "__main__":
         import asyncio
         import json as _json
         import base64 as _base64
+        import uuid as _uuid
+        import hashlib as _hashlib
         import uvicorn
         from starlette.applications import Starlette
         from starlette.middleware import Middleware
@@ -265,6 +267,11 @@ if __name__ == "__main__":
 
         # Pending OAuth flows keyed by state
         _oauth_flows: dict = {}
+        _session_ttl_seconds = 10 * 60  # 10 minutes
+        # session_id -> {"api_key": str, "expires_at": float}
+        _message_sessions: dict = {}
+        # fallback fingerprint -> {"api_key": str, "expires_at": float}
+        _fingerprint_sessions: dict = {}
 
         def _load_client_config() -> dict:
             """Load OAuth client config from env var or credentials.json file."""
@@ -286,6 +293,60 @@ if __name__ == "__main__":
                 or request.headers.get("X-BLToken", "").strip()
                 or request.headers.get("Api-Key", "").strip()
             )
+
+        def _token_fingerprint(token: str) -> str:
+            if not token:
+                return "<none>"
+            digest = _hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+            return f"{token[:6]}...{digest}"
+
+        def _log_auth(route: str, source: str, token: str, decision: str) -> None:
+            print(
+                f"[auth] route={route} source={source} token={_token_fingerprint(token)} decision={decision}"
+            )
+
+        def _now_ts() -> float:
+            import time
+            return time.time()
+
+        def _prune_sessions() -> None:
+            now = _now_ts()
+            for store in (_message_sessions, _fingerprint_sessions):
+                expired = [k for k, v in store.items() if v.get("expires_at", 0) <= now]
+                for k in expired:
+                    store.pop(k, None)
+
+        def _client_fingerprint(request) -> str:
+            xff = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            xrip = request.headers.get("X-Real-IP", "").strip()
+            ua = request.headers.get("User-Agent", "").strip()
+            return _hashlib.sha256(f"{xff}|{xrip}|{ua}".encode("utf-8")).hexdigest()[:16]
+
+        def _create_message_session(api_key: str, request) -> str:
+            _prune_sessions()
+            sid = _uuid.uuid4().hex
+            expires_at = _now_ts() + _session_ttl_seconds
+            _message_sessions[sid] = {"api_key": api_key, "expires_at": expires_at}
+            _fingerprint_sessions[_client_fingerprint(request)] = {
+                "api_key": api_key,
+                "expires_at": expires_at,
+            }
+            return sid
+
+        def _resolve_session_key(request) -> str:
+            _prune_sessions()
+            sid = (
+                request.query_params.get("session_id", "").strip()
+                or request.cookies.get("mcp_session_id", "").strip()
+            )
+            if sid:
+                sess = _message_sessions.get(sid)
+                if sess and sess.get("expires_at", 0) > _now_ts():
+                    return sess.get("api_key", "")
+            fp_sess = _fingerprint_sessions.get(_client_fingerprint(request))
+            if fp_sess and fp_sess.get("expires_at", 0) > _now_ts():
+                return fp_sess.get("api_key", "")
+            return ""
 
         def _resolve_credentials(api_key: str) -> "Credentials | None":
             """Return cached or freshly loaded Credentials for an API key."""
@@ -311,17 +372,25 @@ if __name__ == "__main__":
                     return await call_next(request)
 
                 key = _extract_bearer(request)
+                source = "header"
+                if not key and path == "/messages":
+                    key = _resolve_session_key(request)
+                    source = "session-fallback" if key else "none"
                 if not key:
+                    _log_auth(path, source, key, "rejected")
                     return Response("Unauthorized – missing token", status_code=401)
 
                 # Legacy single key
                 if _legacy_api_key and key == _legacy_api_key:
+                    _log_auth(path, source, key, "accepted")
                     return await call_next(request)
 
                 # Multi-user: quick existence check
                 if not is_valid_key(key):
+                    _log_auth(path, source, key, "rejected")
                     return Response("Unauthorized – unknown token", status_code=401)
 
+                _log_auth(path, source, key, "accepted")
                 return await call_next(request)
 
         # ── SSE / MCP handlers ────────────────────────────────────────────────
@@ -330,10 +399,14 @@ if __name__ == "__main__":
         async def handle_sse(request):
             key = _extract_bearer(request)
             creds = None
+            session_id = ""
 
             # Try multi-user lookup first
             if key and key != _legacy_api_key:
                 creds = await asyncio.to_thread(_resolve_credentials, key)
+                if creds:
+                    session_id = _create_message_session(key, request)
+                    _log_auth("/sse", "header", key, "accepted")
 
             # Set per-connection context so google_chat.py uses the right account
             creds_token = _per_user_creds.set(creds)
@@ -350,13 +423,20 @@ if __name__ == "__main__":
             finally:
                 _per_user_creds.reset(creds_token)
                 _per_user_api_key.reset(key_token)
+                if session_id:
+                    _message_sessions.pop(session_id, None)
 
         async def handle_messages(request):
             key = _extract_bearer(request)
+            source = "header"
+            if not key:
+                key = _resolve_session_key(request)
+                source = "session-fallback" if key else "none"
             creds = None
 
             if key and key != _legacy_api_key:
                 creds = await asyncio.to_thread(_resolve_credentials, key)
+            _log_auth("/messages", source, key, "accepted" if key else "rejected")
 
             creds_token = _per_user_creds.set(creds)
             key_token = _per_user_api_key.set(key if creds else None)
