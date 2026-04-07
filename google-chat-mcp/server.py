@@ -283,7 +283,13 @@ if __name__ == "__main__":
             with open(creds_path) as f:
                 return _json.load(f)
 
-        def _extract_bearer(request) -> tuple[str, str]:
+        def _extract_bearer(request, prefer_query: bool = False) -> tuple[str, str]:
+            q_key = (
+                request.query_params.get("api_key", "").strip()
+                or request.query_params.get("token", "").strip()
+            )
+            if prefer_query and q_key:
+                return q_key, "query"
             auth = request.headers.get("Authorization", "")
             if auth.lower().startswith("bearer "):
                 return auth[7:].strip(), "header"
@@ -296,10 +302,6 @@ if __name__ == "__main__":
             if key:
                 return key, "header"
             # Query fallback for clients that fail to forward headers on SSE connect.
-            q_key = (
-                request.query_params.get("api_key", "").strip()
-                or request.query_params.get("token", "").strip()
-            )
             if q_key:
                 return q_key, "query"
             return "", "none"
@@ -381,7 +383,9 @@ if __name__ == "__main__":
                 if path.startswith("/setup") or path == "/auth/callback":
                     return await call_next(request)
 
-                key, source = _extract_bearer(request)
+                key, source = _extract_bearer(
+                    request, prefer_query=(path == "/sse")
+                )
                 if not key and path == "/messages":
                     key = _resolve_session_key(request)
                     source = "session-fallback" if key else "none"
@@ -406,7 +410,7 @@ if __name__ == "__main__":
         sse = SseServerTransport("/messages")
 
         async def handle_sse(request):
-            key, source = _extract_bearer(request)
+            key, source = _extract_bearer(request, prefer_query=True)
             creds = None
             session_id = ""
 
