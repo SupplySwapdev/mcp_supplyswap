@@ -425,35 +425,34 @@ if __name__ == "__main__":
 
         sse = SseServerTransport("/messages")
 
-        async def handle_sse(request):
-            # Inject the per-connection BaseLinker token into the contextvar
-            token = _extract_token(request)
-            token_ctx = _request_token.set(token)
-            try:
-                async with sse.connect_sse(
-                    request.scope, request.receive, request._send
-                ) as streams:
-                    await mcp._mcp_server.run(
-                        streams[0], streams[1],
-                        mcp._mcp_server.create_initialization_options(),
-                    )
-            finally:
-                _request_token.reset(token_ctx)
+        class SseEndpoint:
+            async def __call__(self, scope, receive, send):
+                request = Request(scope, receive=receive)
+                token = _extract_token(request)
+                token_ctx = _request_token.set(token)
+                try:
+                    async with sse.connect_sse(scope, receive, send) as streams:
+                        await mcp._mcp_server.run(
+                            streams[0], streams[1],
+                            mcp._mcp_server.create_initialization_options(),
+                        )
+                finally:
+                    _request_token.reset(token_ctx)
 
-        async def handle_messages(request):
-            token = _extract_token(request)
-            token_ctx = _request_token.set(token)
-            try:
-                await sse.handle_post_message(
-                    request.scope, request.receive, request._send
-                )
-            finally:
-                _request_token.reset(token_ctx)
+        class MessagesEndpoint:
+            async def __call__(self, scope, receive, send):
+                request = Request(scope, receive=receive)
+                token = _extract_token(request)
+                token_ctx = _request_token.set(token)
+                try:
+                    await sse.handle_post_message(scope, receive, send)
+                finally:
+                    _request_token.reset(token_ctx)
 
         app = Starlette(
             routes=[
-                Route("/sse", endpoint=handle_sse),
-                Route("/messages", endpoint=handle_messages, methods=["POST"]),
+                Route("/sse", endpoint=SseEndpoint()),
+                Route("/messages", endpoint=MessagesEndpoint(), methods=["POST"]),
             ],
             middleware=[Middleware(AuthMiddleware)],
         )
