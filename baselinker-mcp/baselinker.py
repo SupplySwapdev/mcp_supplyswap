@@ -9,6 +9,7 @@ Docs: https://api.baselinker.com/
 import os
 import json
 import httpx
+import hashlib
 from contextvars import ContextVar
 from typing import Any, Dict, Optional
 
@@ -21,13 +22,17 @@ _request_token: ContextVar[Optional[str]] = ContextVar("bl_request_token", defau
 def _get_token() -> str:
     # Per-request token injected from the MCP connection header takes priority
     token = _request_token.get()
+    source = "contextvar"
     if not token:
+        source = "env"
         token = os.environ.get("BASELINKER_TOKEN", "")
     if not token:
         raise RuntimeError(
             "No BaseLinker token found. Pass your token as the API Key "
             "when connecting to this MCP server."
         )
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+    print(f"[bl-token] source={source} token={token[:6]}...{digest}")
     return token
 
 

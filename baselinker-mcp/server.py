@@ -387,6 +387,7 @@ if __name__ == "__main__":
 
     if args.serve:
         from baselinker import _request_token
+        import hashlib
 
         def _extract_token(request) -> str:
             """Pull the BaseLinker token from whichever auth header the client sends."""
@@ -403,6 +404,12 @@ if __name__ == "__main__":
             # Do not silently fall back to env in HTTP/SSE mode; require per-request auth.
             return ""
 
+        def _fp(token: str) -> str:
+            if not token:
+                return "<none>"
+            h = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+            return f"{token[:6]}...{h}"
+
         class AuthMiddleware:
             def __init__(self, app):
                 self.app = app
@@ -414,6 +421,7 @@ if __name__ == "__main__":
                 request = Request(scope, receive=receive, send=send)
                 token = _extract_token(request)
                 if not token:
+                    print(f"[auth] route={scope.get('path')} token=<none> decision=rejected")
                     response = Response(
                         "Unauthorized — provide your BaseLinker API token as the Bearer token "
                         "or X-API-Key when connecting.",
@@ -421,6 +429,7 @@ if __name__ == "__main__":
                     )
                     await response(scope, receive, send)
                     return
+                print(f"[auth] route={scope.get('path')} token={_fp(token)} decision=accepted")
                 await self.app(scope, receive, send)
 
         sse = SseServerTransport("/messages")
@@ -429,6 +438,7 @@ if __name__ == "__main__":
             async def __call__(self, scope, receive, send):
                 request = Request(scope, receive=receive)
                 token = _extract_token(request)
+                print(f"[ctx] route=/sse set_token={_fp(token)}")
                 token_ctx = _request_token.set(token)
                 try:
                     async with sse.connect_sse(scope, receive, send) as streams:
@@ -443,6 +453,7 @@ if __name__ == "__main__":
             async def __call__(self, scope, receive, send):
                 request = Request(scope, receive=receive)
                 token = _extract_token(request)
+                print(f"[ctx] route=/messages set_token={_fp(token)}")
                 token_ctx = _request_token.set(token)
                 try:
                     await sse.handle_post_message(scope, receive, send)
