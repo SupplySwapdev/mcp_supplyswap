@@ -2,6 +2,10 @@
 import os
 import sys
 import argparse
+import time
+import uuid
+import inspect
+import functools
 from typing import List, Dict
 
 from fastmcp import FastMCP
@@ -21,7 +25,48 @@ _port = int(os.environ.get("PORT", 8000))
 # Create an MCP server
 mcp = FastMCP("Google Chat", host="0.0.0.0", port=_port)
 
+
+def _tool_timed(tool_name: str):
+    def decorator(func):
+        if inspect.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                req_id = uuid.uuid4().hex[:12]
+                start = time.perf_counter()
+                print(f"[tool] id={req_id} name={tool_name} event=start")
+                try:
+                    result = await func(*args, **kwargs)
+                    duration_ms = int((time.perf_counter() - start) * 1000)
+                    print(f"[tool] id={req_id} name={tool_name} event=ok duration_ms={duration_ms}")
+                    return result
+                except Exception as e:
+                    duration_ms = int((time.perf_counter() - start) * 1000)
+                    print(f"[tool] id={req_id} name={tool_name} event=error duration_ms={duration_ms} error={type(e).__name__}")
+                    raise
+
+            return async_wrapper
+
+        @functools.wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            req_id = uuid.uuid4().hex[:12]
+            start = time.perf_counter()
+            print(f"[tool] id={req_id} name={tool_name} event=start")
+            try:
+                result = func(*args, **kwargs)
+                duration_ms = int((time.perf_counter() - start) * 1000)
+                print(f"[tool] id={req_id} name={tool_name} event=ok duration_ms={duration_ms}")
+                return result
+            except Exception as e:
+                duration_ms = int((time.perf_counter() - start) * 1000)
+                print(f"[tool] id={req_id} name={tool_name} event=error duration_ms={duration_ms} error={type(e).__name__}")
+                raise
+
+        return sync_wrapper
+
+    return decorator
+
 @mcp.tool()
+@_tool_timed("get_current_datetime")
 def get_current_datetime() -> Dict:
     """Returns the current date and time in UTC. Always call this first before
     querying messages so you know the correct dates to use in other tools.
@@ -51,6 +96,7 @@ def _parse_date(date_str: str, end_of_day: bool = False):
 
 
 @mcp.tool()
+@_tool_timed("get_chat_spaces")
 async def get_chat_spaces(space_type: str = None) -> List[Dict]:
     """List all Google Chat spaces the user is a member of.
 
@@ -62,6 +108,7 @@ async def get_chat_spaces(space_type: str = None) -> List[Dict]:
 
 
 @mcp.tool()
+@_tool_timed("get_space_messages")
 async def get_space_messages(
     space_name: str,
     start_date: str = None,
@@ -106,6 +153,7 @@ async def get_space_messages(
 
 
 @mcp.tool()
+@_tool_timed("send_message")
 async def send_message(space_name: str, text: str, thread_name: str = None) -> Dict:
     """Send a message to a Google Chat space or reply in a thread.
 
@@ -119,6 +167,7 @@ async def send_message(space_name: str, text: str, thread_name: str = None) -> D
 
 
 @mcp.tool()
+@_tool_timed("search_messages")
 async def search_messages(
     keyword: str,
     space_name: str = None,
@@ -139,6 +188,7 @@ async def search_messages(
 
 
 @mcp.tool()
+@_tool_timed("get_space_member_list")
 async def get_space_member_list(space_name: str) -> List[Dict]:
     """List all members of a Google Chat space with their display names and roles.
 
@@ -149,6 +199,7 @@ async def get_space_member_list(space_name: str) -> List[Dict]:
 
 
 @mcp.tool()
+@_tool_timed("get_direct_messages")
 async def get_direct_messages(with_person: str, hours: int = 48, keyword: str = None) -> List[Dict]:
     """Read the DM conversation with a specific person.
 
@@ -161,6 +212,7 @@ async def get_direct_messages(with_person: str, hours: int = 48, keyword: str = 
 
 
 @mcp.tool()
+@_tool_timed("send_direct_message")
 async def send_direct_message(to_person: str, text: str) -> Dict:
     """Send a direct message to a specific person.
 
@@ -172,6 +224,7 @@ async def send_direct_message(to_person: str, text: str) -> Dict:
 
 
 @mcp.tool()
+@_tool_timed("react_to_message")
 async def react_to_message(message_name: str, emoji: str) -> Dict:
     """Add an emoji reaction to a message.
 
@@ -183,6 +236,7 @@ async def react_to_message(message_name: str, emoji: str) -> Dict:
 
 
 @mcp.tool()
+@_tool_timed("get_space_details")
 async def get_space_details(space_name: str) -> Dict:
     """Get detailed info about a space: description, creation date, last activity, member count.
 
@@ -193,6 +247,7 @@ async def get_space_details(space_name: str) -> Dict:
 
 
 @mcp.tool()
+@_tool_timed("get_thread")
 async def get_thread(space_name: str, thread_name: str) -> List[Dict]:
     """Get all messages in a specific thread.
 
@@ -740,8 +795,21 @@ if __name__ == "__main__":
             except Exception as e:
                 return HTMLResponse(f"<p>Error during authentication: {e}</p>", status_code=500)
 
+        async def handle_healthz(request):
+            return Response(
+                _json.dumps(
+                    {
+                        "ok": True,
+                        "service": "google-chat-mcp",
+                        "revision": os.environ.get("K_REVISION", "unknown"),
+                    }
+                ),
+                media_type="application/json",
+            )
+
         starlette_app = Starlette(
             routes=[
+                Route("/healthz", endpoint=handle_healthz),
                 Route("/setup", endpoint=handle_setup),
                 Route("/setup/auth", endpoint=handle_setup_auth),
                 Route("/auth/callback", endpoint=handle_auth_callback),
