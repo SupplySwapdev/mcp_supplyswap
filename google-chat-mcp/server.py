@@ -299,7 +299,7 @@ if __name__ == "__main__":
         import uvicorn
         from starlette.applications import Starlette
         from starlette.middleware import Middleware
-        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.requests import Request
         from starlette.responses import Response, HTMLResponse, RedirectResponse
         from starlette.routing import Route
         from mcp.server.sse import SseServerTransport
@@ -431,89 +431,96 @@ if __name__ == "__main__":
             return creds
 
         # ── Middleware ────────────────────────────────────────────────────────
-        class APIKeyMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request, call_next):
-                # Setup pages are always public
-                path = request.url.path
-                if path.startswith("/setup") or path == "/auth/callback":
-                    return await call_next(request)
+        class APIKeyMiddleware:
+            def __init__(self, app):
+                self.app = app
 
-                key, source = _extract_bearer(
-                    request, prefer_query=(path == "/sse")
-                )
+            async def __call__(self, scope, receive, send):
+                if scope.get("type") != "http":
+                    await self.app(scope, receive, send)
+                    return
+
+                request = Request(scope, receive=receive)
+                path = request.url.path
+                # Public routes
+                if path == "/healthz" or path.startswith("/setup") or path == "/auth/callback":
+                    await self.app(scope, receive, send)
+                    return
+
+                key, source = _extract_bearer(request, prefer_query=(path == "/sse"))
                 if not key and path == "/messages":
                     key = _resolve_session_key(request)
                     source = "session-fallback" if key else "none"
                 if not key:
                     _log_auth(path, source, key, "rejected")
-                    return Response("Unauthorized – missing token", status_code=401)
+                    response = Response("Unauthorized – missing token", status_code=401)
+                    await response(scope, receive, send)
+                    return
 
-                # Legacy single key
                 if _legacy_api_key and key == _legacy_api_key:
                     _log_auth(path, source, key, "accepted")
-                    return await call_next(request)
+                    await self.app(scope, receive, send)
+                    return
 
-                # Multi-user: quick existence check
                 if not is_valid_key(key):
                     _log_auth(path, source, key, "rejected")
-                    return Response("Unauthorized – unknown token", status_code=401)
+                    response = Response("Unauthorized – unknown token", status_code=401)
+                    await response(scope, receive, send)
+                    return
 
                 _log_auth(path, source, key, "accepted")
-                return await call_next(request)
+                await self.app(scope, receive, send)
 
         # ── SSE / MCP handlers ────────────────────────────────────────────────
         sse = SseServerTransport("/messages")
 
-        async def handle_sse(request):
-            key, source = _extract_bearer(request, prefer_query=True)
-            creds = None
-            session_id = ""
+        class SseEndpoint:
+            async def __call__(self, scope, receive, send):
+                request = Request(scope, receive=receive)
+                key, source = _extract_bearer(request, prefer_query=True)
+                creds = None
+                session_id = ""
 
-            # Try multi-user lookup first
-            if key and key != _legacy_api_key:
-                creds = await asyncio.to_thread(_resolve_credentials, key)
-                if creds:
-                    session_id = _create_message_session(key, request)
-                    _log_auth("/sse", source, key, "accepted")
+                if key and key != _legacy_api_key:
+                    creds = await asyncio.to_thread(_resolve_credentials, key)
+                    if creds:
+                        session_id = _create_message_session(key, request)
+                        _log_auth("/sse", source, key, "accepted")
 
-            # Set per-connection context so google_chat.py uses the right account
-            creds_token = _per_user_creds.set(creds)
-            key_token = _per_user_api_key.set(key if creds else None)
+                creds_token = _per_user_creds.set(creds)
+                key_token = _per_user_api_key.set(key if creds else None)
+                try:
+                    async with sse.connect_sse(scope, receive, send) as streams:
+                        await mcp._mcp_server.run(
+                            streams[0], streams[1],
+                            mcp._mcp_server.create_initialization_options(),
+                        )
+                finally:
+                    _per_user_creds.reset(creds_token)
+                    _per_user_api_key.reset(key_token)
+                    if session_id:
+                        _message_sessions.pop(session_id, None)
 
-            try:
-                async with sse.connect_sse(
-                    request.scope, request.receive, request._send
-                ) as streams:
-                    await mcp._mcp_server.run(
-                        streams[0], streams[1],
-                        mcp._mcp_server.create_initialization_options(),
-                    )
-            finally:
-                _per_user_creds.reset(creds_token)
-                _per_user_api_key.reset(key_token)
-                if session_id:
-                    _message_sessions.pop(session_id, None)
+        class MessagesEndpoint:
+            async def __call__(self, scope, receive, send):
+                request = Request(scope, receive=receive)
+                key, source = _extract_bearer(request)
+                if not key:
+                    key = _resolve_session_key(request)
+                    source = "session-fallback" if key else "none"
+                creds = None
 
-        async def handle_messages(request):
-            key, source = _extract_bearer(request)
-            if not key:
-                key = _resolve_session_key(request)
-                source = "session-fallback" if key else "none"
-            creds = None
+                if key and key != _legacy_api_key:
+                    creds = await asyncio.to_thread(_resolve_credentials, key)
+                _log_auth("/messages", source, key, "accepted" if key else "rejected")
 
-            if key and key != _legacy_api_key:
-                creds = await asyncio.to_thread(_resolve_credentials, key)
-            _log_auth("/messages", source, key, "accepted" if key else "rejected")
-
-            creds_token = _per_user_creds.set(creds)
-            key_token = _per_user_api_key.set(key if creds else None)
-            try:
-                await sse.handle_post_message(
-                    request.scope, request.receive, request._send
-                )
-            finally:
-                _per_user_creds.reset(creds_token)
-                _per_user_api_key.reset(key_token)
+                creds_token = _per_user_creds.set(creds)
+                key_token = _per_user_api_key.set(key if creds else None)
+                try:
+                    await sse.handle_post_message(scope, receive, send)
+                finally:
+                    _per_user_creds.reset(creds_token)
+                    _per_user_api_key.reset(key_token)
 
         # ── Setup / onboarding pages ──────────────────────────────────────────
         _SETUP_HTML = """<!DOCTYPE html>
@@ -813,8 +820,8 @@ if __name__ == "__main__":
                 Route("/setup", endpoint=handle_setup),
                 Route("/setup/auth", endpoint=handle_setup_auth),
                 Route("/auth/callback", endpoint=handle_auth_callback),
-                Route("/sse", endpoint=handle_sse),
-                Route("/messages", endpoint=handle_messages, methods=["POST"]),
+                Route("/sse", endpoint=SseEndpoint()),
+                Route("/messages", endpoint=MessagesEndpoint(), methods=["POST"]),
             ],
             middleware=[Middleware(APIKeyMiddleware)],
         )
