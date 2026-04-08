@@ -802,7 +802,7 @@ if __name__ == "__main__":
             except Exception as e:
                 return HTMLResponse(f"<p>Error during authentication: {e}</p>", status_code=500)
 
-        async def handle_healthz(request):
+        async def _health_response():
             return Response(
                 _json.dumps(
                     {
@@ -814,9 +814,17 @@ if __name__ == "__main__":
                 media_type="application/json",
             )
 
+        async def handle_healthz(request):
+            return await _health_response()
+
+        async def handle_readyz(request):
+            # Keep readiness lightweight: service process is up and serving.
+            return await _health_response()
+
         starlette_app = Starlette(
             routes=[
                 Route("/healthz", endpoint=handle_healthz),
+                Route("/readyz", endpoint=handle_readyz),
                 Route("/setup", endpoint=handle_setup),
                 Route("/setup/auth", endpoint=handle_setup_auth),
                 Route("/auth/callback", endpoint=handle_auth_callback),
@@ -828,6 +836,8 @@ if __name__ == "__main__":
 
         print(f"\nStarting Google Chat MCP server in SSE mode")
         print(f"  SSE endpoint  : http://0.0.0.0:{_port}/sse")
+        print(f"  Health check  : http://0.0.0.0:{_port}/healthz")
+        print(f"  Readiness     : http://0.0.0.0:{_port}/readyz")
         print(f"  Setup page    : http://0.0.0.0:{_port}/setup")
         print(f"  Public URL    : {_server_url}")
         print(f"  Auth          : multi-user (Firestore) {'+ legacy key' if _legacy_api_key else ''}")
