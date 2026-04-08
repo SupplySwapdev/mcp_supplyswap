@@ -443,7 +443,7 @@ if __name__ == "__main__":
                 request = Request(scope, receive=receive)
                 path = request.url.path
                 # Public routes
-                if path == "/healthz" or path.startswith("/setup") or path == "/auth/callback":
+                if path.startswith("/healthz") or path.startswith("/readyz") or path.startswith("/setup") or path == "/auth/callback":
                     await self.app(scope, receive, send)
                     return
 
@@ -824,7 +824,9 @@ if __name__ == "__main__":
         starlette_app = Starlette(
             routes=[
                 Route("/healthz", endpoint=handle_healthz),
+                Route("/healthz/", endpoint=handle_healthz),
                 Route("/readyz", endpoint=handle_readyz),
+                Route("/readyz/", endpoint=handle_readyz),
                 Route("/setup", endpoint=handle_setup),
                 Route("/setup/auth", endpoint=handle_setup_auth),
                 Route("/auth/callback", endpoint=handle_auth_callback),
