@@ -263,7 +263,7 @@ if __name__ == "__main__":
     parser.add_argument('--auth', choices=['web', 'cli'],
                         help='Run OAuth authentication (web: browser-based, cli: headless/terminal)')
     parser.add_argument('--serve', action='store_true',
-                        help='Run as HTTP/SSE server (for remote hosting). SSE endpoint: /sse')
+                        help='Run as HTTP server (for remote hosting). Endpoints: /mcp and legacy /sse')
     parser.add_argument('--host', default='localhost', help='Host to bind the auth server to (default: localhost)')
     parser.add_argument('--port', type=int, default=8000, help='Port to run the auth server on (default: 8000)')
     parser.add_argument('--token-path', default='token.json', help='Path to store OAuth token (default: token.json)')
@@ -299,10 +299,11 @@ if __name__ == "__main__":
         import uvicorn
         from starlette.applications import Starlette
         from starlette.middleware import Middleware
+        from starlette.datastructures import MutableHeaders
         from starlette.requests import Request
         from starlette.responses import Response, HTMLResponse, RedirectResponse
-        from starlette.routing import Route
-        from mcp.server.sse import SseServerTransport
+        from starlette.routing import Mount, Route
+        from fastmcp.server.http import SseServerTransport, create_streamable_http_app
         from google_auth_oauthlib.flow import Flow
         from google.oauth2.credentials import Credentials
         from google_chat import SCOPES, _per_user_creds, _per_user_api_key
@@ -323,10 +324,19 @@ if __name__ == "__main__":
         # Pending OAuth flows keyed by state
         _oauth_flows: dict = {}
         _session_ttl_seconds = 10 * 60  # 10 minutes
+        _sse_heartbeat_seconds = max(
+            1.0, float(os.environ.get("MCP_SSE_HEARTBEAT_SECONDS", "30"))
+        )
+        _mcp_http_session_ttl_seconds = max(
+            _session_ttl_seconds,
+            int(os.environ.get("MCP_HTTP_SESSION_TTL_SECONDS", "3600")),
+        )
         # session_id -> {"api_key": str, "expires_at": float}
         _message_sessions: dict = {}
         # fallback fingerprint -> {"api_key": str, "expires_at": float}
         _fingerprint_sessions: dict = {}
+        # mcp-session-id -> {"api_key": str, "expires_at": float}
+        _http_sessions: dict = {}
 
         def _load_client_config() -> dict:
             """Load OAuth client config from env var or credentials.json file."""
@@ -378,7 +388,7 @@ if __name__ == "__main__":
 
         def _prune_sessions() -> None:
             now = _now_ts()
-            for store in (_message_sessions, _fingerprint_sessions):
+            for store in (_message_sessions, _fingerprint_sessions, _http_sessions):
                 expired = [k for k, v in store.items() if v.get("expires_at", 0) <= now]
                 for k in expired:
                     store.pop(k, None)
@@ -415,6 +425,25 @@ if __name__ == "__main__":
                 return fp_sess.get("api_key", "")
             return ""
 
+        def _store_http_session(session_id: str, api_key: str) -> None:
+            if not session_id or not api_key:
+                return
+            _prune_sessions()
+            _http_sessions[session_id] = {
+                "api_key": api_key,
+                "expires_at": _now_ts() + _mcp_http_session_ttl_seconds,
+            }
+
+        def _resolve_http_session_key(request) -> str:
+            _prune_sessions()
+            session_id = request.headers.get("mcp-session-id", "").strip()
+            if not session_id:
+                return ""
+            session = _http_sessions.get(session_id)
+            if session and session.get("expires_at", 0) > _now_ts():
+                return session.get("api_key", "")
+            return ""
+
         def _resolve_credentials(api_key: str) -> "Credentials | None":
             """Return cached or freshly loaded Credentials for an API key."""
             if api_key in _creds_cache:
@@ -430,6 +459,92 @@ if __name__ == "__main__":
             _creds_cache[api_key] = creds
             return creds
 
+        async def _run_sse_session_with_heartbeat(
+            scope,
+            receive,
+            send,
+            *,
+            route_label: str,
+            runner,
+        ) -> None:
+            """Keep the SSE stream active so idle proxies do not drop it."""
+            response_started = asyncio.Event()
+            stopped = asyncio.Event()
+            send_lock = asyncio.Lock()
+            runner_task = None
+
+            async def guarded_receive():
+                message = await receive()
+                if message.get("type") == "http.disconnect":
+                    stopped.set()
+                return message
+
+            async def guarded_send(message):
+                if message.get("type") == "http.response.start":
+                    response_started.set()
+                elif (
+                    message.get("type") == "http.response.body"
+                    and not message.get("more_body", False)
+                ):
+                    stopped.set()
+
+                async with send_lock:
+                    await send(message)
+
+            async def heartbeat_loop():
+                await response_started.wait()
+                while not stopped.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            stopped.wait(), timeout=_sse_heartbeat_seconds
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+
+                    try:
+                        async with send_lock:
+                            await send(
+                                {
+                                    "type": "http.response.body",
+                                    "body": b": keepalive\n\n",
+                                    "more_body": True,
+                                }
+                            )
+                    except Exception as exc:
+                        print(
+                            f"[sse] route={route_label} event=heartbeat_send_failed "
+                            f"error={type(exc).__name__}"
+                        )
+                        stopped.set()
+                        if runner_task is not None:
+                            runner_task.cancel()
+                        return
+
+            heartbeat_task = asyncio.create_task(heartbeat_loop())
+            runner_task = asyncio.create_task(runner(guarded_receive, guarded_send))
+            print(
+                f"[sse] route={route_label} event=connected "
+                f"heartbeat_seconds={_sse_heartbeat_seconds:g}"
+            )
+            try:
+                await runner_task
+            finally:
+                stopped.set()
+                if runner_task is not None and not runner_task.done():
+                    runner_task.cancel()
+                heartbeat_task.cancel()
+                if runner_task is not None:
+                    try:
+                        await runner_task
+                    except asyncio.CancelledError:
+                        pass
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                print(f"[sse] route={route_label} event=disconnected")
+
         # ── Middleware ────────────────────────────────────────────────────────
         class APIKeyMiddleware:
             def __init__(self, app):
@@ -443,7 +558,13 @@ if __name__ == "__main__":
                 request = Request(scope, receive=receive)
                 path = request.url.path
                 # Public routes
-                if path.startswith("/healthz") or path.startswith("/readyz") or path.startswith("/setup") or path == "/auth/callback":
+                if (
+                    path.startswith("/healthz")
+                    or path.startswith("/readyz")
+                    or path.startswith("/setup")
+                    or path == "/auth/callback"
+                    or path.startswith("/mcp")
+                ):
                     await self.app(scope, receive, send)
                     return
 
@@ -471,6 +592,61 @@ if __name__ == "__main__":
                 _log_auth(path, source, key, "accepted")
                 await self.app(scope, receive, send)
 
+        class StreamableHTTPContextMiddleware:
+            def __init__(self, app):
+                self.app = app
+
+            async def __call__(self, scope, receive, send):
+                if scope.get("type") != "http":
+                    await self.app(scope, receive, send)
+                    return
+
+                request = Request(scope, receive=receive)
+                key, source = _extract_bearer(request)
+                if not key:
+                    key = _resolve_http_session_key(request)
+                    source = "mcp-session" if key else "none"
+
+                if not key:
+                    _log_auth("/mcp", source, key, "rejected")
+                    response = Response("Unauthorized – missing token", status_code=401)
+                    await response(scope, receive, send)
+                    return
+
+                if _legacy_api_key and key == _legacy_api_key:
+                    creds = None
+                    decision = "accepted"
+                else:
+                    if not is_valid_key(key):
+                        _log_auth("/mcp", source, key, "rejected")
+                        response = Response("Unauthorized – unknown token", status_code=401)
+                        await response(scope, receive, send)
+                        return
+                    creds = await asyncio.to_thread(_resolve_credentials, key)
+                    decision = "accepted"
+
+                _log_auth("/mcp", source, key, decision)
+                session_hint = request.headers.get("mcp-session-id", "").strip()
+                if session_hint and key:
+                    _store_http_session(session_hint, key)
+
+                creds_token = _per_user_creds.set(creds)
+                key_token = _per_user_api_key.set(key if creds else None)
+
+                async def send_with_session_capture(message):
+                    if message.get("type") == "http.response.start":
+                        headers = MutableHeaders(raw=message["headers"])
+                        session_id = headers.get("mcp-session-id", "").strip()
+                        if session_id:
+                            _store_http_session(session_id, key)
+                    await send(message)
+
+                try:
+                    await self.app(scope, receive, send_with_session_capture)
+                finally:
+                    _per_user_creds.reset(creds_token)
+                    _per_user_api_key.reset(key_token)
+
         # ── SSE / MCP handlers ────────────────────────────────────────────────
         sse = SseServerTransport("/messages")
 
@@ -490,11 +666,22 @@ if __name__ == "__main__":
                 creds_token = _per_user_creds.set(creds)
                 key_token = _per_user_api_key.set(key if creds else None)
                 try:
-                    async with sse.connect_sse(scope, receive, send) as streams:
-                        await mcp._mcp_server.run(
-                            streams[0], streams[1],
-                            mcp._mcp_server.create_initialization_options(),
-                        )
+                    async def _runner(guarded_receive, guarded_send):
+                        async with sse.connect_sse(
+                            scope, guarded_receive, guarded_send
+                        ) as streams:
+                            await mcp._mcp_server.run(
+                                streams[0], streams[1],
+                                mcp._mcp_server.create_initialization_options(),
+                            )
+
+                    await _run_sse_session_with_heartbeat(
+                        scope,
+                        receive,
+                        send,
+                        route_label="/sse",
+                        runner=_runner,
+                    )
                 finally:
                     _per_user_creds.reset(creds_token)
                     _per_user_api_key.reset(key_token)
@@ -603,6 +790,7 @@ if __name__ == "__main__":
 </html>"""
 
         def _success_html(api_key: str, email: str) -> str:
+            mcp_url = f"{_server_url}/mcp"
             sse_url = f"{_server_url}/sse"
             return f"""<!DOCTYPE html>
 <html lang="en">
@@ -695,8 +883,16 @@ if __name__ == "__main__":
     <div class="section">
       <label>MCP Server URL</label>
       <div class="field-row">
-        <span class="field-value" id="url-val">{sse_url}</span>
+        <span class="field-value" id="url-val">{mcp_url}</span>
         <button class="copy-btn" onclick="copy('url-val', this)">Copy</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <label>Legacy SSE URL (for OpenClaw compatibility)</label>
+      <div class="field-row">
+        <span class="field-value" id="sse-url-val">{sse_url}</span>
+        <button class="copy-btn" onclick="copy('sse-url-val', this)">Copy</button>
       </div>
     </div>
 
@@ -722,7 +918,8 @@ if __name__ == "__main__":
       <ol>
         <li>Open your AI tool and go to <strong>Settings → MCP / Integrations</strong></li>
         <li>Click <strong>Add Custom MCP</strong> or <strong>Connect MCP</strong></li>
-        <li>Paste the <strong>MCP Server URL</strong> above</li>
+        <li>Use the <strong>MCP Server URL</strong> above for Notion and other modern MCP clients</li>
+        <li>Use the <strong>Legacy SSE URL</strong> only for clients that explicitly require SSE, such as older OpenClaw setups</li>
         <li>Select <span>Bearer token</span> as the authentication type</li>
         <li>Paste your <strong>token</strong> into the Token field</li>
         <li>Click <strong>Connect</strong> — you're done!</li>
@@ -821,6 +1018,12 @@ if __name__ == "__main__":
             # Keep readiness lightweight: service process is up and serving.
             return await _health_response()
 
+        streamable_http_app = create_streamable_http_app(
+            mcp,
+            "/mcp",
+            middleware=[Middleware(StreamableHTTPContextMiddleware)],
+        )
+
         starlette_app = Starlette(
             routes=[
                 Route("/healthz", endpoint=handle_healthz),
@@ -832,11 +1035,14 @@ if __name__ == "__main__":
                 Route("/auth/callback", endpoint=handle_auth_callback),
                 Route("/sse", endpoint=SseEndpoint()),
                 Route("/messages", endpoint=MessagesEndpoint(), methods=["POST"]),
+                Mount("/", app=streamable_http_app),
             ],
             middleware=[Middleware(APIKeyMiddleware)],
+            lifespan=streamable_http_app.lifespan,
         )
 
-        print(f"\nStarting Google Chat MCP server in SSE mode")
+        print(f"\nStarting Google Chat MCP server in HTTP mode")
+        print(f"  MCP endpoint  : http://0.0.0.0:{_port}/mcp")
         print(f"  SSE endpoint  : http://0.0.0.0:{_port}/sse")
         print(f"  Health check  : http://0.0.0.0:{_port}/healthz")
         print(f"  Readiness     : http://0.0.0.0:{_port}/readyz")

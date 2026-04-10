@@ -376,13 +376,18 @@ if __name__ == "__main__":
     import uvicorn
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
+    from starlette.datastructures import MutableHeaders
     from starlette.requests import Request
     from starlette.responses import Response
-    from starlette.routing import Route
-    from mcp.server.sse import SseServerTransport
+    from starlette.routing import Mount, Route
+    from fastmcp.server.http import SseServerTransport, create_streamable_http_app
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--serve", action="store_true", help="Run as HTTP/SSE server")
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run as HTTP server with /mcp and legacy /sse transports",
+    )
     args = parser.parse_args()
 
     if args.serve:
@@ -418,12 +423,55 @@ if __name__ == "__main__":
             h = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
             return f"{token[:6]}...{h}"
 
+        def _now_ts() -> float:
+            return datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+        _session_ttl_seconds = max(
+            600, int(os.environ.get("MCP_HTTP_SESSION_TTL_SECONDS", "3600"))
+        )
+        _http_sessions: dict[str, dict[str, float | str]] = {}
+
+        def _prune_http_sessions() -> None:
+            now = _now_ts()
+            expired = [
+                session_id
+                for session_id, payload in _http_sessions.items()
+                if float(payload.get("expires_at", 0)) <= now
+            ]
+            for session_id in expired:
+                _http_sessions.pop(session_id, None)
+
+        def _store_http_session(session_id: str, token: str) -> None:
+            if not session_id or not token:
+                return
+            _prune_http_sessions()
+            _http_sessions[session_id] = {
+                "token": token,
+                "expires_at": _now_ts() + _session_ttl_seconds,
+            }
+
+        def _resolve_http_session_token(request) -> str:
+            _prune_http_sessions()
+            session_id = request.headers.get("mcp-session-id", "").strip()
+            if not session_id:
+                return ""
+            payload = _http_sessions.get(session_id)
+            if not payload:
+                return ""
+            if float(payload.get("expires_at", 0)) <= _now_ts():
+                _http_sessions.pop(session_id, None)
+                return ""
+            return str(payload.get("token", ""))
+
         class AuthMiddleware:
             def __init__(self, app):
                 self.app = app
 
             async def __call__(self, scope, receive, send):
                 if scope.get("type") != "http":
+                    await self.app(scope, receive, send)
+                    return
+                if scope.get("path", "").startswith("/mcp"):
                     await self.app(scope, receive, send)
                     return
                 request = Request(scope, receive=receive, send=send)
@@ -442,7 +490,144 @@ if __name__ == "__main__":
                 print(f"[auth] route={scope.get('path')} token={_fp(token)} decision=accepted")
                 await self.app(scope, receive, send)
 
+        class StreamableHTTPContextMiddleware:
+            def __init__(self, app):
+                self.app = app
+
+            async def __call__(self, scope, receive, send):
+                if scope.get("type") != "http":
+                    await self.app(scope, receive, send)
+                    return
+
+                request = Request(scope, receive=receive)
+                token = _extract_token(request)
+                source = "header"
+                if not token:
+                    token = _resolve_http_session_token(request)
+                    source = "mcp-session" if token else "none"
+
+                if not token:
+                    print("[auth] route=/mcp token=<none> decision=rejected")
+                    response = Response(
+                        "Unauthorized — provide your BaseLinker API token as the Bearer token "
+                        "or X-API-Key when connecting.",
+                        status_code=401,
+                    )
+                    await response(scope, receive, send)
+                    return
+
+                print(
+                    f"[auth] route=/mcp source={source} token={_fp(token)} decision=accepted"
+                )
+                session_hint = request.headers.get("mcp-session-id", "").strip()
+                if session_hint:
+                    _store_http_session(session_hint, token)
+
+                token_ctx = _request_token.set(token)
+
+                async def send_with_session_capture(message):
+                    if message.get("type") == "http.response.start":
+                        headers = MutableHeaders(raw=message["headers"])
+                        session_id = headers.get("mcp-session-id", "").strip()
+                        if session_id:
+                            _store_http_session(session_id, token)
+                    await send(message)
+
+                try:
+                    await self.app(scope, receive, send_with_session_capture)
+                finally:
+                    _request_token.reset(token_ctx)
+
         sse = SseServerTransport("/messages")
+        _sse_heartbeat_seconds = max(
+            1.0, float(os.environ.get("MCP_SSE_HEARTBEAT_SECONDS", "30"))
+        )
+
+        async def _run_sse_session_with_heartbeat(
+            scope,
+            receive,
+            send,
+            *,
+            route_label: str,
+            runner,
+        ) -> None:
+            """Keep the SSE stream active so idle proxies do not drop it."""
+            response_started = asyncio.Event()
+            stopped = asyncio.Event()
+            send_lock = asyncio.Lock()
+            runner_task = None
+
+            async def guarded_receive():
+                message = await receive()
+                if message.get("type") == "http.disconnect":
+                    stopped.set()
+                return message
+
+            async def guarded_send(message):
+                if message.get("type") == "http.response.start":
+                    response_started.set()
+                elif (
+                    message.get("type") == "http.response.body"
+                    and not message.get("more_body", False)
+                ):
+                    stopped.set()
+
+                async with send_lock:
+                    await send(message)
+
+            async def heartbeat_loop():
+                await response_started.wait()
+                while not stopped.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            stopped.wait(), timeout=_sse_heartbeat_seconds
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+
+                    try:
+                        async with send_lock:
+                            await send(
+                                {
+                                    "type": "http.response.body",
+                                    "body": b": keepalive\n\n",
+                                    "more_body": True,
+                                }
+                            )
+                    except Exception as exc:
+                        print(
+                            f"[sse] route={route_label} event=heartbeat_send_failed "
+                            f"error={type(exc).__name__}"
+                        )
+                        stopped.set()
+                        if runner_task is not None:
+                            runner_task.cancel()
+                        return
+
+            heartbeat_task = asyncio.create_task(heartbeat_loop())
+            runner_task = asyncio.create_task(runner(guarded_receive, guarded_send))
+            print(
+                f"[sse] route={route_label} event=connected "
+                f"heartbeat_seconds={_sse_heartbeat_seconds:g}"
+            )
+            try:
+                await runner_task
+            finally:
+                stopped.set()
+                if runner_task is not None and not runner_task.done():
+                    runner_task.cancel()
+                heartbeat_task.cancel()
+                if runner_task is not None:
+                    try:
+                        await runner_task
+                    except asyncio.CancelledError:
+                        pass
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                print(f"[sse] route={route_label} event=disconnected")
 
         class SseEndpoint:
             async def __call__(self, scope, receive, send):
@@ -451,11 +636,22 @@ if __name__ == "__main__":
                 print(f"[ctx] route=/sse set_token={_fp(token)}")
                 token_ctx = _request_token.set(token)
                 try:
-                    async with sse.connect_sse(scope, receive, send) as streams:
-                        await mcp._mcp_server.run(
-                            streams[0], streams[1],
-                            mcp._mcp_server.create_initialization_options(),
-                        )
+                    async def _runner(guarded_receive, guarded_send):
+                        async with sse.connect_sse(
+                            scope, guarded_receive, guarded_send
+                        ) as streams:
+                            await mcp._mcp_server.run(
+                                streams[0], streams[1],
+                                mcp._mcp_server.create_initialization_options(),
+                            )
+
+                    await _run_sse_session_with_heartbeat(
+                        scope,
+                        receive,
+                        send,
+                        route_label="/sse",
+                        runner=_runner,
+                    )
                 finally:
                     _request_token.reset(token_ctx)
 
@@ -470,15 +666,24 @@ if __name__ == "__main__":
                 finally:
                     _request_token.reset(token_ctx)
 
+        streamable_http_app = create_streamable_http_app(
+            mcp,
+            "/mcp",
+            middleware=[Middleware(StreamableHTTPContextMiddleware)],
+        )
+
         app = Starlette(
             routes=[
                 Route("/sse", endpoint=SseEndpoint()),
                 Route("/messages", endpoint=MessagesEndpoint(), methods=["POST"]),
+                Mount("/", app=streamable_http_app),
             ],
             middleware=[Middleware(AuthMiddleware)],
+            lifespan=streamable_http_app.lifespan,
         )
 
         print(f"\nBaseLinker MCP server starting")
+        print(f"  MCP endpoint : http://0.0.0.0:{_port}/mcp")
         print(f"  SSE endpoint : http://0.0.0.0:{_port}/sse")
         print(f"  Auth         : pass your BaseLinker token as Bearer token or X-API-Key")
         print("\nPress CTRL+C to stop\n")

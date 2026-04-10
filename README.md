@@ -6,19 +6,21 @@ Monorepo for all SupplySwap MCP (Model Context Protocol) servers — hosted on G
 
 | Folder | Description | Cloud Run URL |
 |---|---|---|
-| `google-chat-mcp/` | Google Chat — read/send messages, DMs, reactions | `https://google-chat-mcp-253940259390.us-central1.run.app/sse` |
-| `baselinker-mcp/` | BaseLinker — orders, inventory, CRM, shipping | `https://baselinker-mcp-253940259390.us-central1.run.app/sse` |
+| `google-chat-mcp/` | Google Chat — read/send messages, DMs, reactions | `https://google-chat-mcp-253940259390.us-central1.run.app/mcp` |
+| `baselinker-mcp/` | BaseLinker — orders, inventory, CRM, shipping | `https://baselinker-mcp-253940259390.us-central1.run.app/mcp` |
 
 ## Connecting to an AI tool
 
 ### Google Chat MCP
-- **URL:** `https://google-chat-mcp-253940259390.us-central1.run.app/sse`
+- **Modern MCP URL:** `https://google-chat-mcp-253940259390.us-central1.run.app/mcp`
+- **Legacy SSE URL:** `https://google-chat-mcp-253940259390.us-central1.run.app/sse`
 - **Auth:** Bearer token — each user gets their own personal token
 - **Onboarding:** visit the setup page, sign in with your `@supplyswap.com` Google account, and copy your token
   👉 **[https://google-chat-mcp-253940259390.us-central1.run.app/setup](https://google-chat-mcp-253940259390.us-central1.run.app/setup)**
 
 ### BaseLinker MCP
-- **URL:** `https://baselinker-mcp-253940259390.us-central1.run.app/sse`
+- **Modern MCP URL:** `https://baselinker-mcp-253940259390.us-central1.run.app/mcp`
+- **Legacy SSE URL:** `https://baselinker-mcp-253940259390.us-central1.run.app/sse`
 - **Auth:** API Key — use your BaseLinker API token directly
   - Key: `X-BLToken`
   - Value: your BaseLinker token (BaseLinker → Account → My Account → API)
